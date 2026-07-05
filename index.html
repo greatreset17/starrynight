@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Starry Night — Infinite</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0d1226;cursor:crosshair;}
+  canvas{display:block;}
+  #vig{position:fixed;inset:0;pointer-events:none;
+    background:radial-gradient(ellipse at 50% 46%, rgba(0,0,0,0) 55%, rgba(6,9,24,.42) 100%);}
+  #ui{position:fixed;right:14px;bottom:12px;display:flex;gap:8px;align-items:center;
+    font:11px/1.4 ui-monospace,Menlo,monospace;color:#cfd6ef;opacity:0;transition:opacity .5s;
+    pointer-events:none;user-select:none;}
+  body.uion #ui{opacity:.9;pointer-events:auto;}
+  body.photo #ui,body.photo #vig{opacity:0!important;pointer-events:none;}
+  body.photo{cursor:none;}
+  #ui .grp{background:rgba(10,14,34,.55);border:1px solid rgba(140,160,220,.25);
+    border-radius:6px;padding:5px 8px;display:flex;gap:6px;align-items:center;backdrop-filter:blur(4px);}
+  #ui button{font:inherit;color:#cfd6ef;background:transparent;border:1px solid transparent;
+    border-radius:4px;padding:2px 6px;cursor:pointer;}
+  #ui button:hover{border-color:rgba(160,180,240,.4);}
+  #ui button.on{background:rgba(120,150,230,.28);border-color:rgba(160,180,240,.5);}
+  #ui input[type=range]{width:70px;accent-color:#7fa0e0;}
+  #ui .lbl{opacity:.6;margin-right:2px;}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="vig"></div>
+<div id="ui">
+  <div class="grp"><span class="lbl">flow</span>
+    <button id="fb0">becalmed</button><button id="fb1" class="on">van gogh</button><button id="fb2">storm</button></div>
+  <div class="grp"><span class="lbl">speed</span><input id="spd" type="range" min="0.2" max="3" step="0.1" value="1"></div>
+  <div class="grp"><span class="lbl">quality</span>
+    <button id="q0">low</button><button id="q1" class="on">med</button><button id="q2">high</button></div>
+  <div class="grp"><button id="photo">photo</button><button id="reset">reset [R]</button></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ============================== SETUP ============================== */
+const TAU = Math.PI*2;
+const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.1, 6000);
+
+/* Home = the exact painting composition */
+const HOME = { pos:new THREE.Vector3(0,10,80), look:new THREE.Vector3(0,26,0) };
+camera.position.copy(HOME.pos); camera.lookAt(HOME.look);
+const homeQuat = camera.quaternion.clone();
+
+/* Composition helper: painting-space (u right 0..1, v up 0..1) -> world ray at distance d,
+   using the HOME camera basis and a fixed design frustum. */
+const DESIGN_ASPECT = 1.55, DESIGN_FOV = 55*Math.PI/180;
+const _hb = (()=>{ const f=new THREE.Vector3(0,0,-1).applyQuaternion(homeQuat);
+  const r=new THREE.Vector3(1,0,0).applyQuaternion(homeQuat);
+  const u=new THREE.Vector3(0,1,0).applyQuaternion(homeQuat); return {f,r,u}; })();
+function fromUV(u, v, d){
+  const th = Math.tan(DESIGN_FOV/2), tw = th*DESIGN_ASPECT;
+  const dir = _hb.f.clone().addScaledVector(_hb.r,(u*2-1)*tw).addScaledVector(_hb.u,(v*2-1)*th).normalize();
+  return HOME.pos.clone().addScaledVector(dir, d);
+}
+
+/* Seeded RNG for stable procedural layout */
+let _s = 1234567;
+function rnd(){ _s = (_s*1664525 + 1013904223)>>>0; return _s/4294967296; }
+
+/* ============================== PALETTE / FEATURES ============================== */
+const FOG_COLOR = new THREE.Color(0x18274d);
+const FOG_D = 0.00115;
+
+/* The eleven stars (u,v,size) + moon, from the painting */
+const STARS = [
+  [0.055,0.80,2.0],[0.16,0.91,1.6],[0.30,0.945,1.7],[0.245,0.57,3.4], /* Venus */
+  [0.44,0.935,1.5],[0.525,0.87,1.4],[0.615,0.945,1.6],[0.665,0.66,1.9],
+  [0.71,0.55,1.5],[0.78,0.445,1.4],[0.855,0.62,1.5]
+];
+const MOON = [0.915,0.835,6.0];
+const VORT_A = fromUV(0.40,0.705,300);   /* great spiral hook */
+const VORT_B = fromUV(0.565,0.635,300);  /* counter-curl */
+
+/* Shell-0 sky center — the visible painted sky sits inside this shell */
+const SKY0 = fromUV(0.47,0.68,300);
+const starWorld = STARS.map(s=>{ const p=fromUV(s[0],s[1], 265+rnd()*55); return new THREE.Vector4(p.x,p.y,p.z,s[2]); });
+const moonWorld = (()=>{ const p=fromUV(MOON[0],MOON[1],330); return new THREE.Vector4(p.x,p.y,p.z,MOON[2]); })();
+const star0Local = [...starWorld, moonWorld].map(v=>new THREE.Vector4(v.x-SKY0.x, v.y-SKY0.y, v.z-SKY0.z, v.w));
+
+/* Shared uniforms (same instances spread into every material) */
+const SHARED = {
+  uTime:{value:0}, uFlow:{value:1}, uCamPos:{value:new THREE.Vector3()},
+  uFog:{value:FOG_COLOR}, uFogD:{value:FOG_D}, uCurlAmp:{value:1.6}
+};
+
+/* Quality presets */
+const QUALITY = {
+  0:{sky:14000, far:22000, halo:2600, ground:12000, cyp:1800, seg:5},
+  1:{sky:34000, far:52000, halo:5200, ground:26000, cyp:3200, seg:7},
+  2:{sky:62000, far:98000, halo:8400, ground:44000, cyp:5200, seg:9}
+};
+let qLevel = 1;
+
+/* ============================== GLSL LIBRARY ============================== */
+const GLSL_COMMON = /* glsl */`
+uniform float uTime; uniform float uFlow; uniform vec3 uCamPos;
+uniform vec3 uFog; uniform float uFogD; uniform float uCurlAmp;
+float hash11(float p){ p=fract(p*443.8975); p*=p+19.19; return fract(p*p); }
+vec3 hash31(float p){ vec3 q=fract(vec3(p)*vec3(443.897,441.423,437.195));
+  q+=dot(q,q.yzx+19.19); return fract((q.xxy+q.yzz)*q.zyx); }
+float vnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float n=i.x+i.y*57.+i.z*113.;
+  return mix(mix(mix(hash11(n),hash11(n+1.),f.x),mix(hash11(n+57.),hash11(n+58.),f.x),f.y),
+             mix(mix(hash11(n+113.),hash11(n+114.),f.x),mix(hash11(n+170.),hash11(n+171.),f.x),f.y),f.z); }
+float fbm(vec3 p){ float a=.5,s=0.; for(int i=0;i<4;i++){ s+=a*vnoise(p); p*=2.03; a*=.5; } return s; }
+vec3 curlN(vec3 p){ float e=.6;
+  float a=vnoise(p+vec3(0,e,0))-vnoise(p-vec3(0,e,0));
+  float b=vnoise(p+vec3(0,0,e))-vnoise(p-vec3(0,0,e));
+  float c=vnoise(p+vec3(e,0,0))-vnoise(p-vec3(e,0,0));
+  return normalize(vec3(a-b, b-c, c-a)+1e-4); }
+`;
+const GLSL_FLOW = /* glsl */`
+uniform vec4 uShell[NSHELL];
+uniform vec4 uStar0[12];
+uniform vec3 uVortA; uniform vec3 uVortB;
+uniform float uRiverY; uniform float uRad;
+vec4 starLocal(int i, float seed, float R){
+  if(seed<0.5) return uStar0[i];
+  vec3 h=hash31(seed*3.31+float(i)*7.77)*2.-1.;
+  float sz=(i==3)?3.4:(1.2+2.2*hash11(seed*1.9+float(i)*3.1));
+  return vec4(h*R*0.75, sz);
+}
+vec3 vort(vec3 p, vec3 c, float str, float rad){
+  vec3 d=p-c; d.z*=1.6; float l=length(d)+1e-3;
+  vec3 t=vec3(-d.y,d.x,0.)/l;
+  return t*str*(l*rad)/(rad*rad*0.15+l*l);
+}
+vec3 flowVel(vec3 p, float seed, float R){
+  vec3 v=vec3(0.);
+  if(seed<0.5){ v+=vort(p,uVortA,10.,55.); v+=vort(p,uVortB,-7.5,42.); }
+  else{
+    vec3 h=hash31(seed*7.13)*2.-1., h2=hash31(seed*13.7)*2.-1.;
+    v+=vort(p,h*R*0.5, 8.+5.*hash11(seed*1.7), R*0.45);
+    v+=vort(p,h2*R*0.5,-(6.+5.*hash11(seed*2.9)), R*0.35);
+  }
+  for(int i=0;i<11;i++){ vec4 st=starLocal(i,seed,R); v+=vort(p,st.xyz,1.8*st.w,7.*st.w); }
+  float ry=(seed<0.5)?uRiverY:(hash11(seed*4.4)*2.-1.)*R*0.4;
+  float band=exp(-pow((p.y-ry)/(R*0.28),2.));
+  v+=vec3(2.4, 0.8*sin(p.x*0.035+seed*6.), 0.)*band;
+  v+=curlN(p*0.016+seed)*uCurlAmp;
+  return v;
+}
+vec3 skyColor(float t, float speed, float s){
+  vec3 c;
+  if(t<0.25)      c=mix(vec3(0.075,0.11,0.23), vec3(0.118,0.184,0.39),(t)*4.);
+  else if(t<0.5)  c=mix(vec3(0.118,0.184,0.39),vec3(0.165,0.29,0.56),(t-0.25)*4.);
+  else if(t<0.75) c=mix(vec3(0.165,0.29,0.56), vec3(0.29,0.44,0.68),(t-0.5)*4.);
+  else            c=mix(vec3(0.29,0.44,0.68),  vec3(0.44,0.58,0.77),(t-0.75)*4.);
+  float riv=smoothstep(2.1,5.2,speed);
+  c=mix(c, mix(vec3(0.50,0.72,0.69),vec3(0.68,0.86,0.79),hash11(s*9.1)), riv*0.85);
+  if(hash11(s*17.3)>0.965) c=mix(c,vec3(0.91,0.89,0.75),0.8);
+  return c;
+}
+`;
+
+const GLSL_VARY = /* glsl */`
+varying vec3 vColor; varying float vEmis; varying vec2 vUv;
+varying vec3 vN; varying vec3 vSide; varying vec3 vWp; varying float vSd;
+`;
+
+/* Builds the ribbon from p(world anchor), dir0/dir1 (flow at ends), len, width, ridge */
+const GLSL_BUILD = /* glsl */`
+vec3 buildRibbon(vec3 world, vec3 d0, vec3 d1, float len, float wid, float ridge){
+  float px=position.x+0.5; float Y=position.y;
+  vec3 dir=normalize(mix(d0,d1,px)+1e-5);
+  vec3 toCam=normalize(uCamPos-world);
+  vec3 side=normalize(cross(dir,toCam)+1e-5);
+  vec3 nrm=normalize(cross(side,dir));
+  float taper=pow(max(sin(px*3.14159),0.02),0.4);
+  float w=wid*taper;
+  vec3 vp=world + dir*(px-0.5)*len + side*Y*w + nrm*(1.-abs(Y))*w*ridge;
+  vN=nrm; vSide=side; vWp=vp; vUv=uv;
+  return vp;
+}
+`;
+
+const STROKE_FS = GLSL_COMMON + GLSL_VARY + /* glsl */`
+void main(){
+  float Y=vUv.y*2.-1.;
+  float tear=fbm(vec3(vUv.x*7.+vSd*40., vSd*90., vUv.y*3.));
+  if(abs(Y) > 0.70+0.55*tear) discard;
+  vec3 N=normalize(mix(vN, vSide*sign(Y), abs(Y)*0.65));
+  float br=fbm(vec3(vUv.y*9.+vSd*70., vUv.x*2.6, vSd*30.));
+  vec3 col=vColor*(0.82+0.30*br);
+  col*=0.90+0.20*fbm(vec3(vUv.x*3.2+vSd*11., vSd*50., 2.));
+  vec3 L=normalize(vec3(0.35,0.5,0.62));
+  float dif=0.62+0.38*max(dot(N,L),0.);
+  vec3 V=normalize(uCamPos-vWp);
+  float ridge=smoothstep(0.12,0.5,abs(Y))*smoothstep(0.95,0.55,abs(Y));
+  float spec=pow(max(dot(reflect(-L,N),V),0.),18.)*(0.35+0.9*ridge*br);
+  col=col*dif + vec3(1.,0.97,0.88)*spec*0.30;
+  col+=vColor*vEmis;
+  float d=length(uCamPos-vWp);
+  col=mix(col,uFog,1.-exp(-d*uFogD));
+  gl_FragColor=vec4(col,1.);
+}`;
+
+function strokeMaterial(vsMain, extraUniforms, defines){
+  const uni = Object.assign({}, SHARED, extraUniforms||{});
+  return new THREE.ShaderMaterial({
+    uniforms:uni, defines:defines||{},
+    vertexShader: GLSL_COMMON + GLSL_VARY + GLSL_BUILD + vsMain,
+    fragmentShader: STROKE_FS,
+    side:THREE.DoubleSide
+  });
+}
+function ribbonGeo(segX, segY, count, extraAttrs){
+  const base=new THREE.PlaneGeometry(1,2,segX,segY);
+  const g=new THREE.InstancedBufferGeometry();
+  g.index=base.index;
+  g.setAttribute('position', base.attributes.position);
+  g.setAttribute('uv', base.attributes.uv);
+  g.instanceCount=count;
+  const s=new Float32Array(count*4);
+  for(let i=0;i<s.length;i++) s[i]=rnd();
+  g.setAttribute('aSeed', new THREE.InstancedBufferAttribute(s,4));
+  if(extraAttrs) for(const [name,arr,sz] of extraAttrs)
+    g.setAttribute(name, new THREE.InstancedBufferAttribute(arr,sz));
+  g.boundingSphere=new THREE.Sphere(new THREE.Vector3(), 1e6);
+  return g;
+}
+/* ============================== DEPTH SHELLS ============================== */
+/* A ShellSet keeps N drifting shell centers; shells left behind the camera are
+   re-seeded ahead of it, so flight continues forever in any direction. */
+class ShellSet{
+  constructor(n, radius, firstCenter, dirInto, gap){
+    this.n=n; this.radius=radius; this.gap=gap;
+    this.uniform={value:[]};
+    this.init0=[];
+    for(let i=0;i<n;i++){
+      const c=firstCenter.clone().addScaledVector(dirInto, i*gap);
+      const seed = i===0 ? 0 : 1+rnd()*90;   /* seed 0 => exact painting layout */
+      this.uniform.value.push(new THREE.Vector4(c.x,c.y,c.z,seed));
+      this.init0.push(new THREE.Vector4(c.x,c.y,c.z,seed));
+    }
+  }
+  reset(){ for(let i=0;i<this.n;i++) this.uniform.value[i].copy(this.init0[i]); }
+  update(camPos, camDir){
+    const maxAhead=this.n*this.gap;
+    for(const s of this.uniform.value){
+      const dx=s.x-camPos.x, dy=s.y-camPos.y, dz=s.z-camPos.z;
+      const along=dx*camDir.x+dy*camDir.y+dz*camDir.z;
+      const dist=Math.sqrt(dx*dx+dy*dy+dz*dz);
+      if(along < -(this.radius+this.gap*0.6) || dist > maxAhead+this.radius*1.6){
+        const j1=(rnd()-0.5)*this.gap*1.4, j2=(rnd()-0.5)*this.gap*1.4;
+        const side=new THREE.Vector3(-camDir.z,0,camDir.x).normalize();
+        const up=new THREE.Vector3().crossVectors(side,camDir);
+        s.set(
+          camPos.x+camDir.x*maxAhead + side.x*j1 + up.x*j2,
+          camPos.y+camDir.y*maxAhead + side.y*j1 + up.y*j2,
+          camPos.z+camDir.z*maxAhead + side.z*j1 + up.z*j2,
+          1+rnd()*90);
+      }
+    }
+  }
+}
+const skyDir = SKY0.clone().sub(HOME.pos).normalize();
+let shellsNear, shellsFar;
+function makeShells(){
+  shellsNear = new ShellSet(6, 170, SKY0.clone(), skyDir, 105);
+  shellsFar  = new ShellSet(8, 360, SKY0.clone().addScaledVector(skyDir,380), skyDir, 260);
+}
+makeShells();
+
+const flowUniforms = (shells)=>({
+  uShell: shells.uniform,
+  uStar0: {value: star0Local},
+  uVortA: {value: VORT_A.clone().sub(SKY0)},
+  uVortB: {value: VORT_B.clone().sub(SKY0)},
+  uRiverY:{value: 6.0},
+  uRad:   {value: shells.radius}
+});
+
+/* ---------- near sky: full impasto ribbons ---------- */
+const SKY_VS = /* glsl */`
+attribute vec4 aSeed; attribute float aShell;
+uniform float uTravel; uniform float uLen; uniform float uWid;
+void main(){
+  vec4 sh=uShell[int(aShell)];
+  float R=uRad;
+  vec3 h=hash31(aSeed.x*91.7+sh.w*0.13)*2.-1.;
+  vec3 anchor=h*R*vec3(1.,0.9,1.);
+  float trav=fract(uTime*0.011*uFlow*(0.5+aSeed.y)+aSeed.z);
+  float fade=smoothstep(0.,0.15,trav)*smoothstep(1.,0.85,trav);
+  vec3 f0=flowVel(anchor,sh.w,R);
+  vec3 p=anchor+normalize(f0+1e-5)*((trav-0.5)*uTravel);
+  vec3 f1=flowVel(p,sh.w,R);
+  float speed=length(f1);
+  float len=uLen*(0.6+0.9*aSeed.w)*(0.75+0.06*speed);
+  vec3 f2=flowVel(p+(f1/max(speed,1e-4))*len*0.5,sh.w,R);
+  vec3 world=p+sh.xyz;
+  float wid=uWid*(0.5+aSeed.x)*fade;
+  vec3 vp=buildRibbon(world,f1,f2,len,wid,0.35);
+  vColor=skyColor(hash11(aSeed.y*31.7+sh.w), speed, aSeed.x+sh.w*0.017);
+  vEmis=0.04*smoothstep(3.5,6.,speed);
+  vSd=aSeed.x+sh.w*0.31;
+  gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.);
+}`;
+
+/* ---------- far sky: cheap oriented stroke sprites + colossal swirls ---------- */
+const FAR_VS = /* glsl */`
+attribute vec4 aSeed; attribute float aShell;
+uniform float uTravel; uniform float uLen; uniform float uWid;
+void main(){
+  vec4 sh=uShell[int(aShell)];
+  float R=uRad;
+  vec3 h=hash31(aSeed.x*77.3+sh.w*0.29)*2.-1.;
+  vec3 anchor=h*R*vec3(1.,0.85,1.);
+  float trav=fract(uTime*0.008*uFlow*(0.5+aSeed.y)+aSeed.z);
+  float fade=smoothstep(0.,0.18,trav)*smoothstep(1.,0.82,trav);
+  vec3 f0=flowVel(anchor*0.55,sh.w,R*0.55);
+  vec3 p=anchor+normalize(f0+1e-5)*((trav-0.5)*uTravel);
+  vec3 f1=flowVel(p*0.55,sh.w,R*0.55);
+  float speed=length(f1);
+  float colossal=step(0.985,aSeed.w);
+  float len=uLen*(0.6+0.9*aSeed.w)*(1.+colossal*7.);
+  vec3 world=p+sh.xyz;
+  float wid=uWid*(0.5+aSeed.x)*fade*(1.+colossal*5.);
+  vec3 vp=buildRibbon(world,f1,f1,len,wid,0.15);
+  vColor=skyColor(hash11(aSeed.y*23.7+sh.w), speed, aSeed.x+sh.w*0.017);
+  vEmis=0.05*smoothstep(3.,5.5,speed);
+  vSd=aSeed.x+sh.w*0.47;
+  gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.);
+}`;
+
+let skyNear, skyFar;
+function shellAttr(count,nShells){
+  const a=new Float32Array(count);
+  for(let i=0;i<count;i++) a[i]=i%nShells;
+  return a;
+}
+function buildSky(q){
+  {
+    const g=ribbonGeo(q.seg,2,q.sky,[['aShell',shellAttr(q.sky,shellsNear.n),1]]);
+    const m=strokeMaterial(GLSL_FLOW+GLSL_BUILD_STUB+SKY_VS,
+      Object.assign(flowUniforms(shellsNear),{uTravel:{value:26},uLen:{value:7.5},uWid:{value:1.05}}),
+      {NSHELL:shellsNear.n});
+    skyNear=new THREE.Mesh(g,m); skyNear.frustumCulled=false; scene.add(skyNear);
+  }
+  {
+    const g=ribbonGeo(1,1,q.far,[['aShell',shellAttr(q.far,shellsFar.n),1]]);
+    const m=strokeMaterial(GLSL_FLOW+GLSL_BUILD_STUB+FAR_VS,
+      Object.assign(flowUniforms(shellsFar),{uTravel:{value:55},uLen:{value:19},uWid:{value:2.6}}),
+      {NSHELL:shellsFar.n});
+    skyFar=new THREE.Mesh(g,m); skyFar.frustumCulled=false; scene.add(skyFar);
+  }
+}
+const GLSL_BUILD_STUB = '';
+
+/* ============================== STARS ============================== */
+/* Halo strokes: concentric orbiting rings of thick yellow paint around each star,
+   pulsing, occasionally shedding flecks that drift outward and dissolve. */
+const HALO_VS = /* glsl */`
+attribute vec4 aSeed; attribute float aShell; attribute float aStar;
+uniform float uWid;
+void main(){
+  vec4 sh=uShell[int(aShell)];
+  int si=int(aStar);
+  vec4 st=(si==11)? ((sh.w<0.5)?uStar0[11]:vec4(hash31(sh.w*5.5+91.)*uRad*0.7-uRad*0.35,2.6))
+                  : starLocal(si,sh.w,uRad);
+  float isMoon=(si==11 && sh.w<0.5)?1.:0.;
+  float ring=floor(aSeed.x*3.999);
+  float pulse=1.+0.05*sin(uTime*0.85+aStar*2.3+sh.w);
+  float rad=st.w*(1.55+ring*0.8+0.5*aSeed.y)*pulse;
+  float fleck=step(0.90,aSeed.w);
+  float drift=fract(uTime*0.02*uFlow*(0.3+aSeed.z)+aSeed.y*7.);
+  rad+=fleck*drift*st.w*6.;
+  float dirS=1.-2.*step(0.5,hash11(aStar*3.7+sh.w));
+  float ang=aSeed.z*6.2832 + uTime*uFlow*(0.22-ring*0.04)*dirS;
+  vec3 lp=vec3(cos(ang),sin(ang),0.)*rad;
+  lp.z+=sin(ang*2.+aSeed.x*9.)*rad*0.16;
+  vec3 p=st.xyz+lp;
+  vec3 dir=normalize(vec3(-sin(ang),cos(ang),0.)*dirS + curlN(p*0.06)*0.35);
+  float len=st.w*(1.1+1.3*aSeed.x)*(1.-fleck*drift*0.5);
+  float wid=uWid*(0.5+0.6*aSeed.y)*(1.-fleck*drift*0.85);
+  wid*=smoothstep(0.,0.05,1.-fleck*drift);
+  vec3 world=p+sh.xyz;
+  vec3 vp=buildRibbon(world,dir,dir,len,wid,0.4);
+  vec3 c0=vec3(1.,0.95,0.77), c1=vec3(1.,0.83,0.28), c2=vec3(0.93,0.66,0.23), c3=vec3(0.72,0.54,0.25);
+  vec3 col=(ring<0.5)?c0:((ring<1.5)?c1:((ring<2.5)?c2:c3));
+  if(isMoon>0.5) col=mix(col,vec3(1.,0.63,0.22),0.65);
+  vColor=col;
+  vEmis=(0.9-ring*0.22)*(1.-fleck*drift*0.9)*(0.9+0.15*sin(uTime*1.4+aStar*5.));
+  vSd=aSeed.x+aStar*0.13;
+  gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.);
+}`;
+
+let halos, cores;
+function buildStars(q){
+  const n=q.halo;
+  const starIdx=new Float32Array(n), shellIdx=new Float32Array(n);
+  for(let i=0;i<n;i++){ starIdx[i]=i%12; shellIdx[i]=(i/12|0)%shellsNear.n; }
+  const g=ribbonGeo(4,2,n,[['aShell',shellIdx,1],['aStar',starIdx,1]]);
+  const m=strokeMaterial(GLSL_FLOW+HALO_VS,
+    Object.assign(flowUniforms(shellsNear),{uWid:{value:0.85}}),
+    {NSHELL:shellsNear.n});
+  halos=new THREE.Mesh(g,m); halos.frustumCulled=false; scene.add(halos);
+
+  /* cores: soft blazing points; index 11 in shell 0 is the crescent moon */
+  const NC=12*shellsNear.n;
+  const pg=new THREE.BufferGeometry();
+  pg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(NC*3),3));
+  const aS=new Float32Array(NC), aH=new Float32Array(NC);
+  for(let i=0;i<NC;i++){ aS[i]=i%12; aH[i]=(i/12|0)%shellsNear.n; }
+  pg.setAttribute('aStar', new THREE.BufferAttribute(aS,1));
+  pg.setAttribute('aShell', new THREE.BufferAttribute(aH,1));
+  pg.boundingSphere=new THREE.Sphere(new THREE.Vector3(),1e6);
+  const pm=new THREE.ShaderMaterial({
+    uniforms:Object.assign({}, SHARED, flowUniforms(shellsNear), {uPx:{value:innerHeight}}),
+    defines:{NSHELL:shellsNear.n},
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending,
+    vertexShader: GLSL_COMMON+GLSL_FLOW+/* glsl */`
+      attribute float aStar; attribute float aShell;
+      uniform float uPx;
+      varying float vMoon; varying float vTw; varying float vSeed;
+      void main(){
+        vec4 sh=uShell[int(aShell)];
+        int si=int(aStar);
+        vec4 st=(si==11)? ((sh.w<0.5)?uStar0[11]:vec4(hash31(sh.w*5.5+91.)*uRad*0.7-uRad*0.35,2.6))
+                        : starLocal(si,sh.w,uRad);
+        vMoon=(si==11 && sh.w<0.5)?1.:0.;
+        vSeed=aStar*1.7+sh.w;
+        vTw=0.9+0.18*sin(uTime*1.3+vSeed*7.);
+        vec3 wp=st.xyz+sh.xyz;
+        vec4 mv=viewMatrix*vec4(wp,1.);
+        float sz=st.w*(2.6+vMoon*1.1)*vTw;
+        gl_PointSize=clamp(sz*uPx*0.9/max(-mv.z,1.), 1., 320.);
+        gl_Position=projectionMatrix*mv;
+      }`,
+    fragmentShader: GLSL_COMMON+/* glsl */`
+      varying float vMoon; varying float vTw; varying float vSeed;
+      void main(){
+        vec2 q=gl_PointCoord*2.-1.;
+        float r=length(q);
+        if(r>1.) discard;
+        float a;
+        vec3 col;
+        if(vMoon>0.5){
+          float d1=length(q)-0.42;
+          float d2=length(q-vec2(0.17,0.06))-0.36;
+          float cres=smoothstep(0.02,-0.02,d1)*smoothstep(-0.02,0.02,d2);
+          float glow=exp(-r*2.1)*0.75;
+          col=vec3(1.,0.62,0.16)*cres*1.6 + vec3(1.,0.55,0.14)*glow;
+          a=max(cres,glow);
+        }else{
+          float core=exp(-r*4.5)*1.6;
+          float glow=exp(-r*1.9)*0.5;
+          float spikes=max(0.,1.-abs(q.x*q.y)*40.)*exp(-r*2.4)*0.35;
+          col=mix(vec3(1.,0.98,0.86),vec3(1.,0.82,0.3),r)*(core+glow+spikes)*vTw;
+          a=(core+glow+spikes);
+        }
+        gl_FragColor=vec4(col,clamp(a,0.,1.));
+      }`
+  });
+  cores=new THREE.Points(pg,pm); cores.frustumCulled=false; cores.renderOrder=10; scene.add(cores);
+}
+/* ============================== THE EARTH ============================== */
+const GLSL_HGT = /* glsl */`
+float hgt(float x,float z){
+  float h=6.*sin(x*0.02+1.7)*sin(z*0.016+0.4)+4.*sin(x*0.045+z*0.012+2.)+2.*sin(x*0.09-z*0.03);
+  h+=8.*smoothstep(40.,-160.,z)*sin(x*0.012+0.5);
+  float m=smoothstep(-240.,-520.,z);
+  h+=m*(52.+22.*sin(x*0.014+2.)+12.*sin(x*0.033+0.7));
+  float vd=length(vec2(x-25.,z+140.));
+  h=mix(h*0.25+0.5,h,smoothstep(25.,90.,vd));
+  return h;
+}`;
+function hgtJS(x,z){
+  let h=6*Math.sin(x*0.02+1.7)*Math.sin(z*0.016+0.4)+4*Math.sin(x*0.045+z*0.012+2)+2*Math.sin(x*0.09-z*0.03);
+  const ss=(a,b,t)=>{const k=Math.min(1,Math.max(0,(t-a)/(b-a)));return k*k*(3-2*k);};
+  h+=8*ss(40,-160,z)*Math.sin(x*0.012+0.5);
+  const m=ss(-240,-520,z);
+  h+=m*(52+22*Math.sin(x*0.014+2)+12*Math.sin(x*0.033+0.7));
+  const vd=Math.hypot(x-25,z+140);
+  h=(h*0.25+0.5)*(1-ss(25,90,vd))+h*ss(25,90,vd);
+  return h;
+}
+
+const GROUND_VS = GLSL_HGT + /* glsl */`
+attribute vec4 aSeed;
+void main(){
+  float mtn=step(0.86,aSeed.w);
+  vec3 a;
+  if(mtn>0.5){
+    a=vec3((aSeed.x-0.5)*1100., 0., -300.-aSeed.y*300.);
+  }else{
+    float ang=aSeed.x*6.2832; float rr=pow(aSeed.y,0.72)*360.;
+    a=vec3(cos(ang)*rr, 0., sin(ang)*rr-70.);
+  }
+  a.y=hgt(a.x,a.z);
+  float e=2.5;
+  float gx=(hgt(a.x+e,a.z)-hgt(a.x-e,a.z))/(2.*e);
+  float gz=(hgt(a.x,a.z+e)-hgt(a.x,a.z-e))/(2.*e);
+  vec3 dir=normalize(vec3(-gz,0.,gx)+1e-4);
+  float wind=0.4*uFlow*sin(uTime*0.55-a.x*0.035-a.z*0.03+aSeed.z*2.);
+  float rot=(aSeed.z-0.5)*1.1+wind;
+  float cs=cos(rot),sn=sin(rot);
+  dir=vec3(dir.x*cs-dir.z*sn,0.,dir.x*sn+dir.z*cs);
+  dir.y=-(gx*dir.x+gz*dir.z); dir=normalize(dir);
+  float dist=length(a.xz-vec2(0.,80.));
+  float len=(2.2+3.5*aSeed.w)*(1.+mtn*3.5)*(1.+smoothstep(150.,400.,dist)*1.6);
+  float wid=(0.55+0.5*aSeed.x)*(1.+mtn*2.2)*(1.+smoothstep(150.,400.,dist)*1.2);
+  a.y+=0.15+0.3*aSeed.z;
+  vec3 vp=buildRibbon(a,dir,dir,len,wid,0.4);
+  float hn=fbm(vec3(a.x*0.02,a.z*0.02,3.));
+  vec3 field1=vec3(0.18,0.30,0.32), field2=vec3(0.27,0.38,0.54),
+       wheat=vec3(0.42,0.44,0.27), dark=vec3(0.10,0.17,0.28);
+  vec3 col=mix(field1,field2,hn);
+  col=mix(col,wheat,smoothstep(0.55,0.8,fbm(vec3(a.x*0.013+9.,a.z*0.013,1.)))*0.7);
+  col=mix(col,dark,smoothstep(0.6,0.9,fbm(vec3(a.x*0.03,a.z*0.03,7.))));
+  col=mix(col,vec3(0.13,0.22,0.42),smoothstep(120.,380.,dist)*0.8);
+  if(mtn>0.5) col=mix(vec3(0.115,0.18,0.38),vec3(0.17,0.26,0.48),hn);
+  float shadow=0.78+0.22*vnoise(vec3(a.x*0.008-uTime*0.022*uFlow,a.z*0.008,1.));
+  col*=shadow;
+  vColor=col; vEmis=0.; vSd=aSeed.x*3.1;
+  gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.);
+}`;
+
+let ground;
+function buildGround(q){
+  const g=ribbonGeo(3,2,q.ground);
+  const m=strokeMaterial(GROUND_VS,{},{});
+  ground=new THREE.Mesh(g,m); ground.frustumCulled=false; scene.add(ground);
+}
+
+/* ---------- village: merged painted geometry + windows + roof dabs + smoke ---------- */
+const houses=[]; const windowsData=[]; const chimneys=[];
+(function layoutVillage(){
+  _s=777;
+  const lanes=[[8,-118],[30,-138],[16,-158],[42,-124],[52,-150],[-2,-140],[24,-176],[38,-166],
+               [10,-132],[46,-138],[0,-124],[34,-152],[20,-146],[54,-128],[6,-168],[28,-128]];
+  for(const [x,z] of lanes){
+    const w=4+rnd()*3, d=4+rnd()*3, hh=3+rnd()*2.5, rot=rnd()*0.9-0.45;
+    const y=hgtJS(x,z);
+    houses.push({x,y,z,w,d,h:hh,rot,roofH:2+rnd()*1.6,roof:rnd()});
+    const nw=1+(rnd()*2.4|0);
+    for(let k=0;k<nw;k++)
+      windowsData.push([x+(rnd()-0.5)*w*0.7, y+hh*0.35+rnd()*hh*0.4, z+d*0.51, rot, 0.55+rnd()*0.3, rnd()*20]);
+    if(rnd()>0.55) chimneys.push([x+(rnd()-0.5)*w*0.5, y+hh+2+rnd(), z]);
+  }
+  /* church + steeple */
+  const cx=18, cz=-136, cy=hgtJS(cx,cz);
+  houses.push({x:cx,y:cy,z:cz,w:6,d:9,h:6.5,rot:0.06,roofH:3,roof:0.2,church:true});
+  windowsData.push([cx-1.5,cy+3,cz+4.6,0.06,0.5,3],[cx+1.5,cy+3.4,cz+4.6,0.06,0.5,11]);
+})();
+
+let villageMesh, windowsMesh, roofDabs, smoke;
+function buildVillage(){
+  const parts=[];
+  const paint=(geo,hex)=>{ const c=new THREE.Color(hex);
+    const n=geo.attributes.position.count; const arr=new Float32Array(n*3);
+    for(let i=0;i<n;i++){ arr[i*3]=c.r; arr[i*3+1]=c.g; arr[i*3+2]=c.b; }
+    geo.setAttribute('color',new THREE.BufferAttribute(arr,3)); return geo; };
+  for(const h of houses){
+    const body=paint(new THREE.BoxGeometry(h.w,h.h,h.d), h.church?0x3d4a72:(rnd()>0.5?0x333f66:0x46527a));
+    body.rotateY(h.rot); body.translate(h.x,h.y+h.h/2,h.z); parts.push(body);
+    const roof=paint(new THREE.ConeGeometry(Math.max(h.w,h.d)*0.72,h.roofH,4),
+      h.roof>0.7?0x5c4436:0x222c50);
+    roof.rotateY(h.rot+Math.PI/4); roof.translate(h.x,h.y+h.h+h.roofH/2,h.z); parts.push(roof);
+    if(h.church){
+      const tow=paint(new THREE.BoxGeometry(2.6,9,2.6),0x37426b);
+      tow.rotateY(h.rot); tow.translate(h.x,h.y+4.5,h.z-2); parts.push(tow);
+      const sp=paint(new THREE.ConeGeometry(2.1,7.5,4),0x1a2340);
+      sp.rotateY(h.rot+Math.PI/4); sp.translate(h.x,h.y+9+3.75,h.z-2); parts.push(sp);
+    }
+  }
+  const merged=mergeGeometries(parts);
+  const vm=new THREE.ShaderMaterial({
+    uniforms:Object.assign({},SHARED),
+    vertexShader:GLSL_COMMON+/* glsl */`
+      attribute vec3 color; varying vec3 vC; varying vec3 vWp; varying vec3 vNn;
+      void main(){ vC=color; vWp=position; vNn=normal;
+        gl_Position=projectionMatrix*viewMatrix*vec4(position,1.); }`,
+    fragmentShader:GLSL_COMMON+/* glsl */`
+      varying vec3 vC; varying vec3 vWp; varying vec3 vNn;
+      void main(){
+        vec3 col=vC*(0.8+0.4*fbm(vWp*vec3(0.5,1.6,0.5)));
+        col*=0.88+0.24*fbm(vec3(vWp.y*2.4,vWp.x*0.4,vWp.z*0.4));
+        vec3 L=normalize(vec3(0.35,0.5,0.62));
+        col*=0.55+0.45*max(dot(normalize(vNn),L),0.);
+        float d=length(uCamPos-vWp);
+        col=mix(col,uFog,1.-exp(-d*uFogD));
+        gl_FragColor=vec4(col,1.); }`
+  });
+  villageMesh=new THREE.Mesh(merged,vm); scene.add(villageMesh);
+
+  /* windows */
+  const WN=windowsData.length;
+  const wg=ribbonGeo(1,1,WN,[
+    ['aWin',new Float32Array(windowsData.flatMap(w=>[w[0],w[1],w[2],w[3]])),4],
+    ['aWin2',new Float32Array(windowsData.flatMap(w=>[w[4],w[5]])),2]]);
+  const wm=strokeMaterial(/* glsl */`
+    attribute vec4 aSeed; attribute vec4 aWin; attribute vec2 aWin2;
+    void main(){
+      float flick=0.72+0.28*sin(uTime*6.3+aWin2.y*7.)*sin(uTime*2.1+aWin2.y*3.);
+      vec3 dir=vec3(cos(aWin.w),0.,-sin(aWin.w));
+      vec3 vp=buildRibbon(aWin.xyz,dir,dir,aWin2.x,aWin2.x*0.8,0.1);
+      vColor=vec3(1.,0.72,0.32); vEmis=1.6*flick; vSd=aWin2.y;
+      gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.); }`,{},{});
+  windowsMesh=new THREE.Mesh(wg,wm); windowsMesh.frustumCulled=false; scene.add(windowsMesh);
+
+  /* roof dabs: shingled strokes sprinkled over the roofs */
+  const RD=houses.length*26;
+  const hd=new Float32Array(RD*4);
+  for(let i=0;i<RD;i++){ const h=houses[i%houses.length];
+    hd[i*4]=h.x; hd[i*4+1]=h.y+h.h+0.4; hd[i*4+2]=h.z; hd[i*4+3]=Math.max(h.w,h.d)*0.62; }
+  const rg=ribbonGeo(1,2,RD,[['aHouse',hd,4]]);
+  const rm=strokeMaterial(/* glsl */`
+    attribute vec4 aSeed; attribute vec4 aHouse;
+    void main(){
+      float ang=aSeed.x*6.2832; float rr=sqrt(aSeed.y)*aHouse.w;
+      vec3 a=aHouse.xyz+vec3(cos(ang)*rr, (1.-rr/aHouse.w)*1.4, sin(ang)*rr);
+      vec3 dir=normalize(vec3(cos(ang),-0.55,sin(ang)));
+      vec3 vp=buildRibbon(a,dir,dir,0.9+aSeed.z*0.9,0.34,0.4);
+      vColor=mix(vec3(0.13,0.17,0.32),vec3(0.34,0.24,0.18),step(0.72,aSeed.w))*(0.8+0.4*aSeed.z);
+      vEmis=0.; vSd=aSeed.x*7.;
+      gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.); }`,{},{});
+  roofDabs=new THREE.Mesh(rg,rm); roofDabs.frustumCulled=false; scene.add(roofDabs);
+
+  /* chimney smoke: curling painted threads */
+  const SN=chimneys.length*70;
+  const cu=new Float32Array(SN*3);
+  for(let i=0;i<SN;i++){ const c=chimneys[i%chimneys.length];
+    cu[i*3]=c[0]; cu[i*3+1]=c[1]; cu[i*3+2]=c[2]; }
+  const sg=ribbonGeo(3,2,SN,[['aChim',cu,3]]);
+  const sm=strokeMaterial(/* glsl */`
+    attribute vec4 aSeed; attribute vec3 aChim;
+    void main(){
+      float rise=fract(uTime*0.028*(0.5+aSeed.y)+aSeed.z);
+      float fade=smoothstep(0.,0.12,rise)*smoothstep(1.,0.6,rise);
+      float sw=rise*3.5;
+      vec3 a=aChim+vec3(sin(rise*8.+aSeed.x*9.)*sw+rise*rise*7., rise*20., cos(rise*7.+aSeed.x*5.)*sw*0.6);
+      vec3 dir=normalize(vec3(0.35+rise, 1.-rise*0.6, 0.15)+curlN(a*0.1+uTime*0.05)*0.5);
+      vec3 vp=buildRibbon(a,dir,dir,1.1+rise*2.2,(0.3+rise*0.7)*fade,0.3);
+      vColor=mix(vec3(0.42,0.47,0.60),vec3(0.20,0.25,0.40),rise);
+      vEmis=0.; vSd=aSeed.x*9.;
+      gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.); }`,{},{});
+  smoke=new THREE.Mesh(sg,sm); smoke.frustumCulled=false; scene.add(smoke);
+}
+/* ============================== THE CYPRESS ============================== */
+const CYP_BASE=new THREE.Vector3(-28, hgtJS(-28,30)-1, 30), CYP_H=47;
+const CYP_VS = /* glsl */`
+attribute vec4 aSeed;
+uniform vec3 uCyp; uniform float uCypH;
+void main(){
+  float t=pow(aSeed.x,0.85)*1.04;
+  float ang=aSeed.y*6.2832;
+  float prof=(4.4*pow(max(1.-t,0.),0.7)+0.35);
+  prof*=0.75+0.5*vnoise(vec3(t*13.,aSeed.z*9.,0.));
+  prof*=1.+0.35*sin(t*21.+aSeed.z*6.283);
+  vec2 sw=vec2(sin(uTime*0.4+t*2.6),cos(uTime*0.33+t*2.1))*t*t*(0.9+0.9*uFlow);
+  float lick=smoothstep(0.72,1.,t);
+  vec3 spine=vec3(uCyp.x+sw.x+t*t*2.0, uCyp.y+t*uCypH, uCyp.z+sw.y);
+  float rr=prof*sqrt(aSeed.w);
+  vec3 a=spine+vec3(cos(ang),0.,sin(ang))*rr;
+  a+=curlN(a*0.09+uTime*0.05*uFlow)*lick*3.2;
+  vec3 dir=normalize(vec3(cos(ang)*0.22,1.,sin(ang)*0.22)
+    +curlN(a*0.07+uTime*0.06*uFlow)*(0.45+lick*0.8));
+  float len=1.6+2.6*(1.-t)+lick*1.6;
+  float wid=0.30+0.28*(1.-t);
+  vec3 vp=buildRibbon(a,dir,dir,len,wid,0.45);
+  float shade=fbm(vec3(a.x*0.25,a.y*0.2,a.z*0.25));
+  vec3 dk=vec3(0.045,0.09,0.05), md=vec3(0.10,0.17,0.10), lt=vec3(0.19,0.30,0.16);
+  vec3 col=mix(dk,md,shade);
+  col=mix(col,lt,smoothstep(0.6,0.95,shade)*max(cos(ang)*0.5+0.5,0.)*0.8);
+  vColor=col; vEmis=0.; vSd=aSeed.x*13.;
+  gl_Position=projectionMatrix*viewMatrix*vec4(vp,1.);
+}`;
+let cypress;
+function buildCypress(q){
+  const g=ribbonGeo(4,2,q.cyp);
+  const m=strokeMaterial(CYP_VS,{uCyp:{value:CYP_BASE},uCypH:{value:CYP_H}},{});
+  cypress=new THREE.Mesh(g,m); cypress.frustumCulled=false; scene.add(cypress);
+}
+
+/* ============================== UNDERPAINTING DOME ============================== */
+const dome=new THREE.Mesh(
+  new THREE.SphereGeometry(3000,32,24),
+  new THREE.ShaderMaterial({
+    uniforms:Object.assign({},SHARED),
+    side:THREE.BackSide, depthWrite:false,
+    vertexShader:GLSL_COMMON+`varying vec3 vDir;
+      void main(){ vDir=position;
+        gl_Position=projectionMatrix*viewMatrix*vec4(position+uCamPos,1.); }`,
+    fragmentShader:GLSL_COMMON+/* glsl */`
+      varying vec3 vDir;
+      void main(){
+        vec3 d=normalize(vDir);
+        vec3 lo=vec3(0.045,0.062,0.115), mid=vec3(0.088,0.132,0.265), hi=vec3(0.058,0.088,0.195);
+        vec3 col=mix(lo,mid,smoothstep(-0.25,0.18,d.y));
+        col=mix(col,hi,smoothstep(0.18,0.85,d.y));
+        float f=fbm(vec3(d.x*5.,d.y*16.,d.z*5.));
+        col*=0.90+0.20*f;
+        col*=0.93+0.12*fbm(vec3(d.x*14.,d.y*40.,d.z*14.)+3.7);
+        gl_FragColor=vec4(col,1.); }`
+  }));
+dome.frustumCulled=false; dome.renderOrder=-1; scene.add(dome);
+/* ============================== BUILD / REBUILD ============================== */
+function disposeMesh(m){ if(!m) return; scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+function buildAll(){
+  const q=QUALITY[qLevel];
+  buildSky(q); buildStars(q); buildGround(q); buildCypress(q);
+}
+function rebuild(){
+  [skyNear,skyFar,halos,cores,ground,cypress].forEach(disposeMesh);
+  buildAll();
+}
+buildAll(); buildVillage();
+
+/* ============================== FLIGHT ============================== */
+const vel=new THREE.Vector3();
+let yaw=0, pitch=0;                      /* offsets from home orientation */
+const parallax={x:0,y:0};                /* subtle mouse parallax */
+let dragging=false, lastX=0, lastY=0, idleT=0, moved=false;
+let speedMult=1, transit=null;
+const keys={};
+const parPos=new THREE.Vector3(), prevPar=new THREE.Vector3(), parTarget=new THREE.Vector3();
+
+function camDir(){ return new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion); }
+function applyOrientation(){
+  const q=new THREE.Quaternion().setFromEuler(new THREE.Euler(
+    pitch+parallax.y, yaw+parallax.x, 0,'YXZ'));
+  camera.quaternion.copy(new THREE.Quaternion().multiplyQuaternions(q, homeQuat));
+}
+/* store home orientation as euler so yaw/pitch compose sanely */
+{ const e=new THREE.Euler().setFromQuaternion(homeQuat,'YXZ');
+  yaw=e.y; pitch=e.x; homeQuat.identity(); }
+const HOME_YAW=yaw, HOME_PITCH=pitch;
+
+addEventListener('mousemove',e=>{
+  idleT=0; moved=true;
+  document.body.classList.add('uion');
+  if(dragging){
+    yaw  -=(e.clientX-lastX)*0.0026;
+    pitch-=(e.clientY-lastY)*0.0026;
+    pitch=Math.max(-1.45,Math.min(1.45,pitch));
+    lastX=e.clientX; lastY=e.clientY;
+  }else{
+    parallax.x=-(e.clientX/innerWidth-0.5)*0.055;
+    parallax.y=-(e.clientY/innerHeight-0.5)*0.045;
+  }
+});
+addEventListener('mousedown',e=>{ if(e.target.closest('#ui'))return;
+  dragging=true; lastX=e.clientX; lastY=e.clientY; });
+addEventListener('mouseup',()=>dragging=false);
+addEventListener('wheel',e=>{ idleT=0;
+  vel.addScaledVector(camDir(), -Math.sign(e.deltaY)*7.5*speedMult); },{passive:true});
+addEventListener('keydown',e=>{ keys[e.code]=true; idleT=0;
+  if(e.code==='KeyR') goPreset(0);
+  if(e.code==='KeyP') document.body.classList.toggle('photo');
+  if(e.code==='Escape') document.body.classList.remove('photo');
+  if(e.code>='Digit1'&&e.code<='Digit6') goPreset(+e.code.slice(5)-1);
+});
+addEventListener('keyup',e=>keys[e.code]=false);
+
+/* Presets: [position, lookAt] */
+const spiralHeart=VORT_A.clone();
+const PRESETS=[
+  [HOME.pos.clone(), HOME.look.clone()],                                       /* 1 painting */
+  [new THREE.Vector3(24,hgtJS(24,-132)+5,-128), new THREE.Vector3(SKY0.x,SKY0.y+40,SKY0.z)], /* 2 rooftops */
+  [CYP_BASE.clone().add(new THREE.Vector3(16,CYP_H*0.85,14)), CYP_BASE.clone().add(new THREE.Vector3(0,CYP_H*0.8,0))], /* 3 cypress crown */
+  [new THREE.Vector3(moonWorld.x-26,moonWorld.y-4,moonWorld.z+30), new THREE.Vector3(moonWorld.x,moonWorld.y,moonWorld.z)], /* 4 moon */
+  [SKY0.clone().addScaledVector(skyDir,320).add(new THREE.Vector3(0,60,0)), new THREE.Vector3(20,0,-140)], /* 5 deep sky -> village */
+  [spiralHeart.clone().add(new THREE.Vector3(0,0,26)), spiralHeart.clone()]    /* 6 spiral heart */
+];
+function goPreset(i){
+  const [p,l]=PRESETS[i];
+  const q0=camera.quaternion.clone();
+  const m=new THREE.Matrix4().lookAt(p,l,new THREE.Vector3(0,1,0));
+  const q1=new THREE.Quaternion().setFromRotationMatrix(m);
+  transit={t:0,dur:i===0?2.6:2.2,p0:camera.position.clone(),p1:p.clone(),q0,q1,home:i===0};
+  vel.set(0,0,0);
+}
+function endTransit(){
+  const e=new THREE.Euler().setFromQuaternion(camera.quaternion,'YXZ');
+  yaw=e.y; pitch=e.x; parallax.x=parallax.y=0;
+  parPos.set(0,0,0); prevPar.set(0,0,0);
+  if(transit.home){ shellsNear.reset(); shellsFar.reset(); yaw=HOME_YAW; pitch=HOME_PITCH; }
+  transit=null;
+}
+
+/* ============================== UI ============================== */
+const $=id=>document.getElementById(id);
+function bindGroup(ids,fn){ ids.forEach((id,i)=>$(id).onclick=()=>{ ids.forEach(x=>$(x).classList.remove('on')); $(id).classList.add('on'); fn(i); }); }
+bindGroup(['fb0','fb1','fb2'],i=>{ SHARED.uFlow.value=[0.35,1,2.2][i]; SHARED.uCurlAmp.value=[0.9,1.6,3.4][i]; });
+bindGroup(['q0','q1','q2'],i=>{ qLevel=i; rebuild(); });
+$('spd').oninput=e=>speedMult=+e.target.value;
+$('photo').onclick=()=>document.body.classList.add('photo');
+$('reset').onclick=()=>goPreset(0);
+let uiTimer;
+addEventListener('mousemove',()=>{ clearTimeout(uiTimer);
+  uiTimer=setTimeout(()=>document.body.classList.remove('uion'),2600); });
+
+/* ============================== LOOP ============================== */
+const clock=new THREE.Clock();
+function frame(){
+  requestAnimationFrame(frame);
+  const dt=Math.min(clock.getDelta(),0.05);
+  SHARED.uTime.value+=dt;
+  idleT+=dt;
+
+  if(transit){
+    transit.t+=dt/transit.dur;
+    const k=transit.t>=1?1:(transit.t*transit.t*(3-2*transit.t));
+    camera.position.lerpVectors(transit.p0,transit.p1,k);
+    camera.quaternion.slerpQuaternions(transit.q0,transit.q1,k);
+    if(transit.t>=1) endTransit();
+  }else{
+    applyOrientation();
+    const d=camDir();
+    const right=new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+    /* positional parallax: strokes at different depths slide against each other */
+    const up=new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion);
+    parTarget.set(0,0,0).addScaledVector(right,parallax.x*-160).addScaledVector(up,parallax.y*-110);
+    parPos.lerp(parTarget,1-Math.exp(-dt*2.5));
+    camera.position.sub(prevPar).add(parPos); prevPar.copy(parPos);
+    const th=26*speedMult*(keys.ShiftLeft||keys.ShiftRight?3:1);
+    if(keys.KeyW||keys.ArrowUp)    vel.addScaledVector(d, th*dt);
+    if(keys.KeyS||keys.ArrowDown)  vel.addScaledVector(d,-th*dt);
+    if(keys.KeyA||keys.ArrowLeft)  vel.addScaledVector(right,-th*dt);
+    if(keys.KeyD||keys.ArrowRight) vel.addScaledVector(right, th*dt);
+    if(keys.KeyQ) vel.y-=th*dt;
+    if(keys.KeyE) vel.y+=th*dt;
+    if(idleT>7 && moved) vel.addScaledVector(d, 1.1*dt);   /* hands-off drift */
+    vel.multiplyScalar(Math.exp(-dt*1.5));
+    camera.position.addScaledVector(vel,dt);
+    /* soft floor: never sink under the paint of the earth */
+    const floor=hgtJS(camera.position.x,camera.position.z)+2.2;
+    if(camera.position.y<floor){ camera.position.y+=(floor-camera.position.y)*Math.min(1,dt*6); vel.y=Math.max(vel.y,0); }
+  }
+
+  SHARED.uCamPos.value.copy(camera.position);
+  const d=camDir();
+  shellsNear.update(camera.position,d);
+  shellsFar.update(camera.position,d);
+  dome.position.copy(camera.position);
+
+  renderer.render(scene,camera);
+}
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+  if(cores) cores.material.uniforms.uPx.value=innerHeight;
+});
+frame();
+</script>
+</body>
+</html>
